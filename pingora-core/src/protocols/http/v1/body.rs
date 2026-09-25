@@ -29,6 +29,7 @@ use crate::utils::BufRef;
 
 // TODO: make this dynamically adjusted
 const BODY_BUFFER_SIZE: usize = 1024 * 64;
+const CL_READ_SLACK: usize = 1024;
 // limit how much incomplete chunk-size and chunk-ext to buffer
 const PARTIAL_CHUNK_HEAD_LIMIT: usize = 1024 * 8;
 // Trailers: https://datatracker.ietf.org/doc/html/rfc9112#section-7.1.2
@@ -174,7 +175,11 @@ impl BodyReader {
     }
 
     fn prepare_buf(&mut self, buf_to_rewind: &[u8]) {
-        let mut body_buf = BytesMut::with_capacity(self.body_buf_size.max(buf_to_rewind.len()));
+        self.prepare_buf_sized(buf_to_rewind, self.body_buf_size);
+    }
+
+    fn prepare_buf_sized(&mut self, buf_to_rewind: &[u8], size: usize) {
+        let mut body_buf = BytesMut::with_capacity(size.max(buf_to_rewind.len()));
         if !buf_to_rewind.is_empty() {
             self.rewind_buf_len = buf_to_rewind.len();
             // TODO: this is still 1 copy. Make it zero
@@ -246,7 +251,10 @@ impl BodyReader {
                 }
             }
             _ => {
-                self.prepare_buf(buf_to_rewind);
+                self.prepare_buf_sized(
+                    buf_to_rewind,
+                    cl.saturating_add(CL_READ_SLACK).min(self.body_buf_size),
+                );
                 self.body_state = PS::Partial(0, cl);
             }
         }
@@ -405,6 +413,9 @@ impl BodyReader {
         // is left of this body and leave anything past it on the stream
         let read_size = match self.body_state {
             PS::Partial(_, remaining) if !self.upstream => remaining.min(self.body_buf_size),
+            PS::Partial(_, remaining) => remaining
+                .saturating_add(CL_READ_SLACK)
+                .min(self.body_buf_size),
             _ => self.body_buf_size,
         };
         if n == 0 {

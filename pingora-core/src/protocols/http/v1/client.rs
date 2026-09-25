@@ -2932,4 +2932,45 @@ mod test_sync {
         assert!(request_target_has_forbidden_byte(b"/x HTTP/1.1")); // SP
         assert!(request_target_has_forbidden_byte(b"/a\r\nb")); // CR/LF
     }
+
+    #[tokio::test]
+    async fn content_length_body_buffer_is_sized_to_the_body() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
+        let mock_io = tokio_test::io::Builder::new()
+            .read(&head[..])
+            .read(b"a")
+            .read(b"bc")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_response().await.unwrap();
+        let first = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), b"a");
+        let cap = http_stream
+            .body_reader
+            .body_buf
+            .as_ref()
+            .unwrap()
+            .capacity();
+        assert!(cap < 4096, "a 3-byte body got a {cap}-byte read buffer");
+        let rest = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(rest.as_ref(), b"bc");
+    }
+
+    #[tokio::test]
+    async fn excess_past_content_length_is_still_detected() {
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n";
+        let mut rest = b"abc".to_vec();
+        rest.extend(vec![b'x'; 8192]);
+        let mock_io = tokio_test::io::Builder::new()
+            .read(&head[..])
+            .read(&rest)
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_response().await.unwrap();
+        while http_stream.read_body_bytes().await.unwrap().is_some() {}
+        assert!(http_stream.body_reader.body_complete());
+        assert!(http_stream.body_reader.has_bytes_overread());
+        // the excess past the read slack is left unread, which the mock rejects on drop
+        std::mem::forget(http_stream);
+    }
 }

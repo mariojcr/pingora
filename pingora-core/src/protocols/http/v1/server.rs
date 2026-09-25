@@ -585,14 +585,18 @@ impl HttpSession {
     /// Read the request body. `Ok(None)` when there is no (more) body to read.
     pub async fn read_body_bytes(&mut self) -> Result<Option<Bytes>> {
         let read = self.read_body().await?;
-        Ok(read.map(|b| {
+        let read = read.map(|b| {
             let bytes = Bytes::copy_from_slice(self.get_body(&b));
             self.body_bytes_read += bytes.len();
             if let Some(buffer) = self.retry_buffer.as_mut() {
                 buffer.write_to_buffer(&bytes);
             }
             bytes
-        }))
+        });
+        if self.body_reader.body_done() {
+            self.body_reader.body_buf = None;
+        }
+        Ok(read)
     }
 
     async fn do_read_body(&mut self) -> Result<Option<BufRef>> {
@@ -2003,6 +2007,42 @@ mod tests_stream {
         assert_eq!(http_stream.body_bytes_read(), 0);
         assert_eq!(http_stream.body_reader.body_state, ParseState::Complete(0));
         assert_eq!(http_stream.body_reader.get_body_overread().unwrap(), b"a");
+    }
+
+    #[tokio::test]
+    async fn body_read_buffer_released_once_body_complete() {
+        init_log();
+        let head = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 6\r\n\r\n";
+        let mock_io = Builder::new()
+            .read(&head[..])
+            .read(b"abc")
+            .read(b"def")
+            .build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let first = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), b"abc");
+        assert!(http_stream.body_reader.body_buf.is_some());
+        let second = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(second.as_ref(), b"def");
+        assert!(http_stream.body_reader.body_buf.is_none());
+        assert!(http_stream.read_body_bytes().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn body_read_buffer_release_keeps_pipelined_request() {
+        init_log();
+        let input = b"POST / HTTP/1.1\r\nHost: pingora.org\r\nContent-Length: 3\r\n\r\nabcGET /next HTTP/1.1\r\n\r\n";
+        let mock_io = Builder::new().read(&input[..]).build();
+        let mut http_stream = HttpSession::new(Box::new(mock_io));
+        http_stream.read_request().await.unwrap();
+        let body = http_stream.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(body.as_ref(), b"abc");
+        assert!(http_stream.body_reader.body_buf.is_none());
+        assert_eq!(
+            http_stream.body_reader.get_body_overread().unwrap(),
+            b"GET /next HTTP/1.1\r\n\r\n"
+        );
     }
 
     #[tokio::test]
