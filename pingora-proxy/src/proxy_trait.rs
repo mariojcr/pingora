@@ -569,6 +569,37 @@ where
         Ok(())
     }
 
+    /// How long to wait for the upstream's response header before
+    /// [`Self::upstream_response_waiting`] is first called. `None` (the default): it is never called.
+    ///
+    /// Asked once per attempt, after the request header has been sent to the upstream. HTTP/1.x
+    /// upstreams only.
+    fn upstream_response_wait(&self, _session: &Session<DS>, _ctx: &Self::CTX) -> Option<Duration> {
+        None
+    }
+
+    /// Called while the upstream's response header has not arrived yet: first after the delay that
+    /// [`Self::upstream_response_wait`] gave, then after each delay this returns (`None` stops it).
+    ///
+    /// It may write to the downstream, e.g. a provisional response header and body bytes that keep
+    /// the client from giving up on a slow upstream. Once a final response header has been written
+    /// downstream, the upstream's header still goes through the response filters (they are where
+    /// its status is read) but is not written: the response body follows the header that is already
+    /// there, and a header that ends the response ends the body, with an empty end of body through
+    /// the body filters. Not meant for upgrades nor for responses served from cache.
+    ///
+    /// An error ends the attempt like any other error while proxying ([`Self::error_while_proxy`]).
+    async fn upstream_response_waiting(
+        &self,
+        _session: &mut Session<DS>,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(None)
+    }
+
     /// Modify the response header from the upstream
     ///
     /// The modification is before caching, so any change here will be stored in the cache if enabled.

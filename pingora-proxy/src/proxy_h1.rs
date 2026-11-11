@@ -41,7 +41,12 @@ where
         SV: ProxyHttp<DS> + Send + Sync,
         <SV as ProxyHttp<DS>>::CTX: Send + Sync,
     {
-        client_session.read_timeout = peer.options.read_timeout;
+        // The response header may have its own timeout (`response_header_timeout`); the body is
+        // read with `read_timeout` (proxy_handle_upstream switches once the header is in).
+        client_session.read_timeout = peer
+            .options
+            .response_header_timeout
+            .or(peer.options.read_timeout);
         client_session.write_timeout = peer.options.write_timeout;
 
         // phase 2 send to upstream
@@ -174,7 +179,13 @@ where
                 &mut downstream_custom_message_reader,
                 pipe_state.clone(),
             ),
-            self.proxy_handle_upstream(client_session, tx_upstream, rx_downstream, pipe_state),
+            self.proxy_handle_upstream(
+                client_session,
+                tx_upstream,
+                rx_downstream,
+                pipe_state,
+                peer.options.read_timeout,
+            ),
         );
 
         if let Some(custom_session) = session.downstream_session.as_custom_mut() {
@@ -266,6 +277,7 @@ where
         tx: mpsc::Sender<HttpTask>,
         mut rx: mpsc::Receiver<HttpTask>,
         pipe_state: Arc<AtomicU8>,
+        body_read_timeout: Option<Duration>,
     ) -> Result<bool>
     where
         SV: ProxyHttp<DS> + Send + Sync,
@@ -284,6 +296,10 @@ where
                     match res {
                         Ok(task) => {
                             response_done = task.is_end();
+                            // From the final response header on, the reads are the body's.
+                            if is_final_header(&task) {
+                                client_session.read_timeout = body_read_timeout;
+                            }
                             if !upgraded && client_session.was_upgraded() {
                                 // upgrade can only happen once
                                 upgraded = true;
@@ -384,6 +400,7 @@ where
         serve_from_cache: &mut ServeFromCache,
         range_body_filter: &mut proxy_cache::range_filter::RangeBodyFilter,
         response_state: &mut ResponseStateMachine,
+        final_header: &mut bool,
     ) -> Result<Option<bool>>
     where
         SV: ProxyHttp<DS> + Send + Sync,
@@ -412,9 +429,16 @@ where
         }
         response_state.maybe_set_upstream_producer_done(tasks.iter().any(HttpTask::is_end));
 
+        // A final header is already downstream: the provisional one upstream_response_waiting wrote
+        // while the upstream's was on its way.
+        let provisional = session
+            .response_written()
+            .is_some_and(|r| is_final_status(r.status));
+
         /* run filters before sending to downstream */
         let mut filtered_tasks = Vec::with_capacity(TASK_BUFFER_SIZE);
         for mut t in tasks {
+            *final_header |= is_final_header(&t);
             if self.revalidate_or_stale(session, &mut t, ctx).await {
                 serve_from_cache.enable();
                 response_state.enable_cached_response();
@@ -451,6 +475,24 @@ where
                     continue;
                 }
             }
+            // After a provisional header the upstream's went through the filters (where its status
+            // is read) but is not written. One that ends the response ends the body, and the body
+            // filters see that end, as they would see the end of a body.
+            let task = match task {
+                HttpTask::Header(_, true) if provisional => {
+                    self.h1_response_filter(
+                        session,
+                        HttpTask::Body(None, true),
+                        ctx,
+                        serve_from_cache,
+                        range_body_filter,
+                        false,
+                    )
+                    .await?
+                }
+                HttpTask::Header(_, false) if provisional => continue,
+                task => task,
+            };
             filtered_tasks.push(task);
         }
 
@@ -458,6 +500,10 @@ where
         {
             // TODO: need to derive response_done from filtered_tasks in case downstream failed already
             return Ok(None);
+        }
+
+        if filtered_tasks.is_empty() {
+            return Ok(Some(false));
         }
 
         let response_done = session.write_response_tasks(filtered_tasks).await?;
@@ -540,6 +586,13 @@ where
         let mut next_upstream_task: Option<HttpTask> = None;
         let mut fill_cancellation = CacheFillCancellationState::new();
 
+        // While the upstream's response header has not arrived, the application may be called on
+        // a timer (upstream_response_waiting). The upstream's final header ends that.
+        let mut wait_at = self
+            .inner
+            .upstream_response_wait(session, ctx)
+            .map(|d| time::Instant::now() + d);
+
         /* duplex mode without caching
          * Read body from downstream while reading response from upstream
          * If response is done, only read body from downstream
@@ -587,6 +640,8 @@ where
             let support_cache_partial_read =
                 session.cache.support_streaming_partial_write() == Some(true);
             let upgraded = session.was_upgraded();
+
+            let response_wait: OptionFuture<_> = wait_at.map(time::sleep_until).into();
 
             tokio::select! {
                 // only try to send to pipe if there is capacity to avoid deadlock
@@ -666,11 +721,20 @@ where
                      */
                 },
 
+                Some(()) = response_wait, if wait_at.is_some() => {
+                    wait_at = self
+                        .inner
+                        .upstream_response_waiting(session, ctx)
+                        .await?
+                        .map(|d| time::Instant::now() + d);
+                },
+
                 // Handle buffered upstream task from previous iteration
                 task = async { next_upstream_task.take() }, if next_upstream_task.is_some() => {
                     debug!("buffered upstream event: {:?}", task);
                     if let Some(t) = task {
-                        let Some(response_done) = self.process_upstream_tasks(
+                        let mut final_header = false;
+                        let processed = self.process_upstream_tasks(
                             session,
                             ctx,
                             t,
@@ -678,7 +742,13 @@ where
                             &mut serve_from_cache,
                             &mut range_body_filter,
                             &mut response_state,
-                        ).await? else {
+                            &mut final_header,
+                        ).await;
+                        // It batches what has arrived: the final header may be any of them.
+                        if final_header {
+                            wait_at = None;
+                        }
+                        let Some(response_done) = processed? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
                         };
@@ -695,8 +765,9 @@ where
                     let task = task?;
                     debug!("upstream event: {:?}", task);
                     if let Some(t) = task {
+                        let mut final_header = false;
                         let upgraded = session.was_upgraded();
-                        let Some(response_done) = self.process_upstream_tasks(
+                        let processed = self.process_upstream_tasks(
                             session,
                             ctx,
                             t,
@@ -704,7 +775,13 @@ where
                             &mut serve_from_cache,
                             &mut range_body_filter,
                             &mut response_state,
-                        ).await? else {
+                            &mut final_header,
+                        ).await;
+                        // It batches what has arrived: the final header may be any of them.
+                        if final_header {
+                            wait_at = None;
+                        }
+                        let Some(response_done) = processed? else {
                             // nothing sent downstream e.g. serve_from_cache
                             continue;
                         };
@@ -1237,6 +1314,17 @@ pub(crate) async fn send_body_to1(
     } else {
         Ok(false)
     }
+}
+
+/// Whether `status` is a final response: not 1xx, except `101 Switching Protocols`, which is the last
+/// header of an upgrade.
+fn is_final_status(status: http::StatusCode) -> bool {
+    !status.is_informational() || status == http::StatusCode::SWITCHING_PROTOCOLS
+}
+
+/// Whether `task` is the upstream's final response header.
+fn is_final_header(task: &HttpTask) -> bool {
+    matches!(task, HttpTask::Header(h, _) if is_final_status(h.status))
 }
 
 #[cfg(test)]
