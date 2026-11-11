@@ -501,6 +501,13 @@ pub struct PeerOptions {
     pub connection_timeout: Option<Duration>,
     pub total_connection_timeout: Option<Duration>,
     pub read_timeout: Option<Duration>,
+    /// How long the upstream may take to send its response header, when that is not
+    /// [`Self::read_timeout`]. `read_timeout` then applies from the response body on: a backend
+    /// that is slow to start answering (a model thinking before its first token) but must not go
+    /// quiet halfway. 1xx headers other than `101` are read with it too. `None`: the header is read
+    /// with `read_timeout`, as every other read.
+    /// HTTP/1.x upstreams only.
+    pub response_header_timeout: Option<Duration>,
     pub idle_timeout: Option<Duration>,
     pub write_timeout: Option<Duration>,
     pub verify_cert: bool,
@@ -577,6 +584,7 @@ impl PeerOptions {
             connection_timeout: None,
             total_connection_timeout: None,
             read_timeout: None,
+            response_header_timeout: None,
             idle_timeout: None,
             write_timeout: None,
             verify_cert: true,
